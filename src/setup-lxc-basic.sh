@@ -51,6 +51,8 @@ if [[ "$CREATE_USER" == "yes" ]]; then
       adduser -D "$USERNAME"
       echo "$USERNAME:$PASSWORD" | chpasswd
       addgroup "$USERNAME" wheel
+	  # Enable wheel group in sudoers
+      sed -i 's/^# %wheel/%wheel/' /etc/sudoers
       ;;
     debian|*)
       useradd -m -s /bin/bash "$USERNAME"
