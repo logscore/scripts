@@ -1,6 +1,25 @@
 #!/bin/bash
 set -euo pipefail
 
+# --- Distro detection ---
+if [ -f /etc/debian_version ]; then
+  DISTRO="debian"
+elif [ -f /etc/alpine-release ]; then
+  DISTRO="alpine"
+else
+  DISTRO="unknown"
+fi
+
+# Ensure sudo is available
+if ! command -v sudo &>/dev/null; then
+  echo "[*] sudo not found. Installing..."
+  if [[ "$DISTRO" == "alpine" ]]; then
+    apk add --no-cache sudo shadow
+  elif [[ "$DISTRO" == "debian" ]]; then
+    apt-get update && apt-get install -y sudo
+  fi
+fi
+
 # --- Create user? ---
 read -rp "Create a new user? (Y/n): " CREATE_USER
 case "${CREATE_USER:-y}" in
@@ -26,9 +45,19 @@ if [[ "$CREATE_USER" == "yes" ]]; then
   done
 
   echo "[*] Creating user $USERNAME..."
-  useradd -m -s /bin/bash "$USERNAME"
-  echo "$USERNAME:$PASSWORD" | chpasswd
-  usermod -aG sudo "$USERNAME"
+
+  case "$DISTRO" in
+    alpine)
+      adduser -D "$USERNAME"
+      echo "$USERNAME:$PASSWORD" | chpasswd
+      addgroup "$USERNAME" wheel
+      ;;
+    debian|*)
+      useradd -m -s /bin/bash "$USERNAME"
+      echo "$USERNAME:$PASSWORD" | chpasswd
+      usermod -aG sudo "$USERNAME"
+      ;;
+  esac
 
   mkdir -p "/home/$USERNAME/.ssh"
   chmod 700 "/home/$USERNAME/.ssh"
@@ -90,13 +119,20 @@ EOF
 echo "[*] Validating config..."
 sshd -t
 
+# --- Restart sshd (systemd vs openrc) ---
 echo "[*] Restarting sshd..."
-systemctl restart sshd
+if command -v systemctl &>/dev/null; then
+  systemctl restart sshd
+elif command -v rc-service &>/dev/null; then
+  rc-service sshd restart
+else
+  pkill sshd || true; /usr/sbin/sshd
+fi
 
 echo ""
 if [[ "$CREATE_USER" == "yes" ]]; then
-  echo "Done. User: $USERNAME | Root login: $ROOT_SETTING"
+  echo "Done. User: $USERNAME | Root login: $ROOT_SETTING | Distro: $DISTRO"
 else
-  echo "Done. No new user created. Root login: $ROOT_SETTING"
+  echo "Done. No new user created. Root login: $ROOT_SETTING | Distro: $DISTRO"
 fi
 echo "Old config backed up."
