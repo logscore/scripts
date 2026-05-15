@@ -1,11 +1,6 @@
 #!/bin/sh
 set -eu
 
-usage() {
-  echo "Usage: $0 <backup-user> <source-path> <public-key-file>"
-  exit 1
-}
-
 require_root() {
   if [ "$(id -u)" -ne 0 ]; then
     echo "Must run as root"
@@ -37,15 +32,16 @@ create_user_if_missing() {
   user="$1"
 
   if id "$user" >/dev/null 2>&1; then
+    echo "User already exists: $user"
+    return
+  fi
+
+  if command -v apk >/dev/null 2>&1; then
+    adduser -D "$user"
     return
   fi
 
   if command -v adduser >/dev/null 2>&1; then
-    if command -v apk >/dev/null 2>&1; then
-      adduser -D "$user"
-      return
-    fi
-
     adduser --disabled-password --gecos "" "$user"
     return
   fi
@@ -76,6 +72,9 @@ setup_ssh_key() {
   pubkey=$(cat "$pubkey_file")
   if ! grep -Fqx "$pubkey" "$auth_keys"; then
     echo "$pubkey" >> "$auth_keys"
+    echo "Added SSH key"
+  else
+    echo "SSH key already present"
   fi
 
   chown "$user:$user" "$auth_keys"
@@ -109,14 +108,61 @@ grant_readonly_acl() {
   setfacl -dR -m "u:$user:rX" "$target"
 }
 
+prompt() {
+  label="$1"
+  default="${2:-}"
+
+  if [ -n "$default" ]; then
+    printf "%s [%s]: " "$label" "$default"
+  else
+    printf "%s: " "$label"
+  fi
+
+  read -r value
+
+  if [ -z "$value" ]; then
+    value="$default"
+  fi
+
+  echo "$value"
+}
+
+confirm() {
+  label="$1"
+
+  while true; do
+    printf "%s [y/n]: " "$label"
+    read -r answer
+
+    case "$answer" in
+      y | Y | yes | YES)
+        return 0
+        ;;
+      n | N | no | NO)
+        return 1
+        ;;
+      *)
+        echo "Please answer y or n"
+        ;;
+    esac
+  done
+}
+
 main() {
-  [ "$#" -eq 3 ] || usage
-
   require_root
+  install_acl_tools
 
-  backup_user="$1"
-  source_path="$2"
-  public_key_file="$3"
+  echo "Backup source setup"
+  echo
+
+  backup_user=$(prompt "Backup username" "backup")
+  source_path=$(prompt "Source directory to grant read access to")
+  public_key_file=$(prompt "Path to SSH public key file" "/root/.ssh/id_ed25519.pub")
+
+  if [ -z "$source_path" ]; then
+    echo "Source path is required"
+    exit 1
+  fi
 
   if [ ! -d "$source_path" ]; then
     echo "Source path does not exist or is not a directory: $source_path"
@@ -128,16 +174,26 @@ main() {
     exit 1
   fi
 
-  install_acl_tools
+  echo
+  echo "Summary"
+  echo "  User: $backup_user"
+  echo "  Source path: $source_path"
+  echo "  Public key: $public_key_file"
+  echo
+
+  if ! confirm "Continue"; then
+    echo "Aborted"
+    exit 0
+  fi
+
   create_user_if_missing "$backup_user"
   setup_ssh_key "$backup_user" "$public_key_file"
   grant_parent_traverse "$backup_user" "$source_path"
   grant_readonly_acl "$backup_user" "$source_path"
 
+  echo
   echo "Done."
-  echo "User: $backup_user"
-  echo "Source: $source_path"
-  echo "Test:"
+  echo "Test local access with:"
   echo "  su -s /bin/sh $backup_user -c 'find \"$source_path\" | head'"
 }
 
