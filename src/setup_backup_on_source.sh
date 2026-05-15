@@ -1,200 +1,155 @@
 #!/bin/sh
 set -eu
 
-require_root() {
-  if [ "$(id -u)" -ne 0 ]; then
-    echo "Must run as root"
-    exit 1
-  fi
-}
+if [ "$(id -u)" -ne 0 ]; then
+  echo "Run this as root." >&2
+  exit 1
+fi
 
-install_acl_tools() {
+if [ ! -r /etc/os-release ]; then
+  echo "Cannot detect distro." >&2
+  exit 1
+fi
+
+. /etc/os-release
+
+install_acl() {
   if command -v setfacl >/dev/null 2>&1; then
     return
   fi
 
-  if command -v apk >/dev/null 2>&1; then
-    apk add --no-cache acl
-    return
-  fi
-
-  if command -v apt-get >/dev/null 2>&1; then
-    apt-get update
-    apt-get install -y acl
-    return
-  fi
-
-  echo "Could not install ACL tools. Unsupported system."
-  exit 1
+  case "${ID:-}" in
+    alpine)
+      apk add --no-cache acl
+      ;;
+    debian | ubuntu)
+      apt-get update
+      apt-get install -y acl
+      ;;
+    *)
+      echo "Unsupported distro: ${ID:-unknown}" >&2
+      exit 1
+      ;;
+  esac
 }
 
-create_user_if_missing() {
+create_user() {
   user="$1"
 
   if id "$user" >/dev/null 2>&1; then
-    echo "User already exists: $user"
     return
   fi
 
-  if command -v apk >/dev/null 2>&1; then
-    adduser -D "$user"
-    return
-  fi
-
-  if command -v adduser >/dev/null 2>&1; then
-    adduser --disabled-password --gecos "" "$user"
-    return
-  fi
-
-  if command -v useradd >/dev/null 2>&1; then
-    useradd -m -s /bin/sh "$user"
-    return
-  fi
-
-  echo "Could not create user. Unsupported system."
-  exit 1
+  case "${ID:-}" in
+    alpine)
+      adduser -D "$user"
+      ;;
+    debian | ubuntu)
+      adduser --disabled-password --gecos "" "$user"
+      ;;
+    *)
+      echo "Unsupported distro: ${ID:-unknown}" >&2
+      exit 1
+      ;;
+  esac
 }
 
-setup_ssh_key() {
+get_home_dir() {
   user="$1"
-  pubkey_file="$2"
-
-  home_dir=$(getent passwd "$user" | cut -d: -f6)
-  ssh_dir="$home_dir/.ssh"
-  auth_keys="$ssh_dir/authorized_keys"
-
-  mkdir -p "$ssh_dir"
-  chmod 700 "$ssh_dir"
-  touch "$auth_keys"
-  chmod 600 "$auth_keys"
-  chown -R "$user:$user" "$ssh_dir"
-
-  pubkey=$(cat "$pubkey_file")
-  if ! grep -Fqx "$pubkey" "$auth_keys"; then
-    echo "$pubkey" >> "$auth_keys"
-    echo "Added SSH key"
-  else
-    echo "SSH key already present"
-  fi
-
-  chown "$user:$user" "$auth_keys"
+  awk -F: -v u="$user" '$1 == u { print $6 }' /etc/passwd
 }
 
 grant_parent_traverse() {
   user="$1"
-  target="$2"
+  path="$2"
 
-  current="/"
-  old_ifs="$IFS"
-  IFS="/"
+  old_ifs=$IFS
+  IFS='/'
+  set -- $path
+  IFS=$old_ifs
 
-  for part in $target; do
+  current=""
+  for part in "$@"; do
     [ -n "$part" ] || continue
-    current="${current%/}/$part"
-
-    if [ "$current" != "$target" ]; then
+    current="$current/$part"
+    if [ "$current" != "$path" ]; then
       setfacl -m "u:$user:--x" "$current"
     fi
   done
-
-  IFS="$old_ifs"
 }
 
-grant_readonly_acl() {
-  user="$1"
-  target="$2"
+printf "Backup username [backup]: "
+read -r BACKUP_USER
+BACKUP_USER=${BACKUP_USER:-backup}
 
-  setfacl -R -m "u:$user:rX" "$target"
-  setfacl -dR -m "u:$user:rX" "$target"
-}
+printf "Absolute directory to back up: "
+read -r TARGET_PATH
 
-prompt() {
-  label="$1"
-  default="${2:-}"
+if [ -z "$TARGET_PATH" ]; then
+  echo "Path is required." >&2
+  exit 1
+fi
 
-  if [ -n "$default" ]; then
-    printf "%s [%s]: " "$label" "$default"
-  else
-    printf "%s: " "$label"
-  fi
-
-  read -r value
-
-  if [ -z "$value" ]; then
-    value="$default"
-  fi
-
-  echo "$value"
-}
-
-confirm() {
-  label="$1"
-
-  while true; do
-    printf "%s [y/n]: " "$label"
-    read -r answer
-
-    case "$answer" in
-      y | Y | yes | YES)
-        return 0
-        ;;
-      n | N | no | NO)
-        return 1
-        ;;
-      *)
-        echo "Please answer y or n"
-        ;;
-    esac
-  done
-}
-
-main() {
-  require_root
-  install_acl_tools
-
-  echo "Backup source setup"
-  echo
-
-  backup_user=$(prompt "Backup username" "backup")
-  source_path=$(prompt "Source directory to grant read access to")
-  public_key_file=$(prompt "Path to SSH public key file" "/root/.ssh/id_ed25519.pub")
-
-  if [ -z "$source_path" ]; then
-    echo "Source path is required"
+case "$TARGET_PATH" in
+  /*) ;;
+  *)
+    echo "Use an absolute path." >&2
     exit 1
-  fi
+    ;;
+esac
 
-  if [ ! -d "$source_path" ]; then
-    echo "Source path does not exist or is not a directory: $source_path"
-    exit 1
-  fi
+if [ "$TARGET_PATH" != "/" ]; then
+  TARGET_PATH=${TARGET_PATH%/}
+fi
 
-  if [ ! -f "$public_key_file" ]; then
-    echo "Public key file does not exist: $public_key_file"
-    exit 1
-  fi
+if [ ! -d "$TARGET_PATH" ]; then
+  echo "Directory does not exist: $TARGET_PATH" >&2
+  exit 1
+fi
 
-  echo
-  echo "Summary"
-  echo "  User: $backup_user"
-  echo "  Source path: $source_path"
-  echo "  Public key: $public_key_file"
-  echo
+printf "Paste SSH public key: "
+read -r PUBKEY
 
-  if ! confirm "Continue"; then
-    echo "Aborted"
-    exit 0
-  fi
+if [ -z "$PUBKEY" ]; then
+  echo "Public key is required." >&2
+  exit 1
+fi
 
-  create_user_if_missing "$backup_user"
-  setup_ssh_key "$backup_user" "$public_key_file"
-  grant_parent_traverse "$backup_user" "$source_path"
-  grant_readonly_acl "$backup_user" "$source_path"
+install_acl
+create_user "$BACKUP_USER"
 
-  echo
-  echo "Done."
-  echo "Test local access with:"
-  echo "  su -s /bin/sh $backup_user -c 'find \"$source_path\" | head'"
-}
+HOME_DIR=$(get_home_dir "$BACKUP_USER")
+if [ -z "$HOME_DIR" ]; then
+  echo "Could not determine home dir for $BACKUP_USER" >&2
+  exit 1
+fi
 
-main "$@"
+SSH_DIR="$HOME_DIR/.ssh"
+AUTH_KEYS="$SSH_DIR/authorized_keys"
+
+mkdir -p "$SSH_DIR"
+touch "$AUTH_KEYS"
+chmod 700 "$SSH_DIR"
+chmod 600 "$AUTH_KEYS"
+chown -R "$BACKUP_USER:$BACKUP_USER" "$SSH_DIR"
+
+if ! grep -Fqx -- "$PUBKEY" "$AUTH_KEYS"; then
+  printf "%s\n" "$PUBKEY" >> "$AUTH_KEYS"
+fi
+
+chown "$BACKUP_USER:$BACKUP_USER" "$AUTH_KEYS"
+
+grant_parent_traverse "$BACKUP_USER" "$TARGET_PATH"
+setfacl -R -m "u:$BACKUP_USER:rX" "$TARGET_PATH"
+find "$TARGET_PATH" -type d -exec setfacl -m "d:u:$BACKUP_USER:rX" {} \;
+
+echo
+echo "Done."
+echo "User: $BACKUP_USER"
+echo "Path: $TARGET_PATH"
+echo
+echo "Test locally:"
+echo "  su - $BACKUP_USER -c 'find $TARGET_PATH -maxdepth 2 | head'"
+echo
+echo "Backrest source example:"
+echo "  sftp:$BACKUP_USER@host:$TARGET_PATH"
